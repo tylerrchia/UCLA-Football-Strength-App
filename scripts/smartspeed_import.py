@@ -13,6 +13,7 @@ team_id = os.getenv("VALD_TENANT_ID")
 print(f"[smartspeed] team_id (VALD_TENANT_ID): {team_id}")
 print(f"[smartspeed] client_id present: {bool(clientId)}")
 print(f"[smartspeed] client_secret present: {bool(clientSecret)}")
+print(f"[smartspeed] pandas version: {pd.__version__}")
 
 # read in profiles for team
 output_dir = os.getenv("DATA_OUTPUT_DIR", "data")
@@ -54,11 +55,6 @@ token_cache = {
 }
 
 def get_token(client_id, client_secret):
-    """
-    Retrieves and caches a Bearer token using client_credentials flow.
-    """
-
-    # return cached token if still valid
     if (
         token_cache["access_token"]
         and token_cache["expires_at"]
@@ -67,29 +63,21 @@ def get_token(client_id, client_secret):
         return token_cache["access_token"]
 
     url = "https://auth.prd.vald.com/oauth/token"
-    
     payload = {
         "grant_type": "client_credentials",
         "client_id": client_id,
         "client_secret": client_secret,
         "audience": "vald-api-external"
     }
-
     response = request_with_retry("POST", url, data=payload)
-
     if response.status_code != 200:
         raise Exception(f"Token request failed: {response.status_code} - {response.text}")
-
     data = response.json()
-
     access_token = data["access_token"]
     expires_in = data.get("expires_in", 7200)
-
     token_cache["access_token"] = f"Bearer {access_token}"
     token_cache["expires_at"] = time.time() + expires_in
-
     print("New token cached")
-
     return token_cache["access_token"]
 
 token = get_token(clientId, clientSecret)
@@ -99,19 +87,15 @@ headers = {
     "Accept": "application/json"
 }
 
-# function to get last 7 days
 def get_last_7_days_utc():
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     return seven_days_ago.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-# pull only last 7 days of data
 def pull_last_7_days_tests(team_id: str) -> pd.DataFrame:
     all_data = []
     page = 1
-
     base_url = f"https://prd-use-api-extsmartspeed.valdperformance.com/v1/team/{team_id}/tests"
     print(f"[smartspeed] API URL: {base_url}")
-
     test_from_utc = get_last_7_days_utc()
     print(f"[smartspeed] Pulling tests from: {test_from_utc}")
 
@@ -120,37 +104,25 @@ def pull_last_7_days_tests(team_id: str) -> pd.DataFrame:
             "Authorization": get_token(clientId, clientSecret),
             "Accept": "application/json"
         }
-
-        params = {
-            "testFromUtc": test_from_utc,
-            "page": page
-        }
-
+        params = {"testFromUtc": test_from_utc, "page": page}
         response = request_with_retry("GET", base_url, headers=headers, params=params)
-
         if response.status_code != 200:
             raise Exception(f"API error {response.status_code}: {response.text}")
 
-        # Log raw response structure on first page to diagnose format issues
         if page == 1:
             raw = response.json()
             print(f"[smartspeed] Page 1 raw response type: {type(raw).__name__}")
             if isinstance(raw, dict):
                 print(f"[smartspeed] Page 1 response keys: {list(raw.keys())}")
-                print(f"[smartspeed] WARNING: Expected a list but got a dict — API response format may have changed")
-                # attempt to extract a list from common wrapper keys
                 for key in ("results", "data", "tests", "items", "records"):
                     if key in raw and isinstance(raw[key], list):
-                        print(f"[smartspeed] Found records under key '{key}', using that")
                         data = raw[key]
                         break
                 else:
-                    print(f"[smartspeed] Could not find a list in the response — exiting with no data")
                     sys.exit(0)
             elif isinstance(raw, list):
                 data = raw
             else:
-                print(f"[smartspeed] Unexpected response type: {type(raw).__name__} — exiting")
                 sys.exit(0)
         else:
             data = response.json()
@@ -161,9 +133,7 @@ def pull_last_7_days_tests(team_id: str) -> pd.DataFrame:
                         break
 
         if not data:
-            print(f"[smartspeed] Page {page} returned empty — done paginating")
             break
-
         all_data.extend(data)
         print(f"[smartspeed] Pulled page {page} ({len(data)} records)")
         page += 1
@@ -175,7 +145,6 @@ df = pull_last_7_days_tests(team_id)
 
 if df.empty:
     print("[smartspeed] No new tests returned by the API in the last 7 days. Exiting.")
-    print("[smartspeed] Check: correct team_id? SmartSpeed credentials valid? Tests synced to API?")
     sys.exit(0)
 
 print(f"[smartspeed] Columns returned by API: {list(df.columns)}")
@@ -184,11 +153,7 @@ print(f"[smartspeed] Columns returned by API: {list(df.columns)}")
 df['runningSummaryFields'] = df['runningSummaryFields'].apply(
     lambda x: ast.literal_eval(x) if isinstance(x, str) else x
 )
-
-# flatten completely
 running_expanded = pd.json_normalize(df['runningSummaryFields'])
-
-# merge back
 df = pd.concat(
     [df.drop(columns=['runningSummaryFields']),
      running_expanded],
@@ -196,45 +161,21 @@ df = pd.concat(
 )
 
 # normalize column format
-df['profileId'] = (
-    df['profileId']
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-profiles['profileId'] = (
-    profiles['profileId']
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
+df['profileId'] = df['profileId'].astype(str).str.strip().str.lower()
+profiles['profileId'] = profiles['profileId'].astype(str).str.strip().str.lower()
 
 print(f"[smartspeed] Unique profileIds from API: {df['profileId'].nunique()}")
 print(f"[smartspeed] Unique profileIds in profiles: {profiles['profileId'].nunique()}")
 
-# filter to only keep football players
 df_filtered = df[df['profileId'].isin(profiles['profileId'])]
 print(f"[smartspeed] Records matching football player profiles: {len(df_filtered)}")
 
 if df_filtered.empty:
-    print("[smartspeed] WARNING: API returned data but none of the profileIds matched profiles_with_groups.csv")
-    print(f"[smartspeed] Sample profileIds from API: {df['profileId'].head(5).tolist()}")
-    print(f"[smartspeed] Sample profileIds from profiles: {profiles['profileId'].head(5).tolist()}")
     sys.exit(0)
 
-# add name column based on profileId
-df_filtered = df_filtered.merge(
-    profiles[['profileId', 'name']],
-    on='profileId',
-    how='inner'
-)
-
-# move name column to the front
+df_filtered = df_filtered.merge(profiles[['profileId', 'name']], on='profileId', how='inner')
 cols = ['name'] + [col for col in df_filtered.columns if col != 'name']
 df_filtered = df_filtered[cols]
-
-# drop columns that are not needed (ignore if missing, e.g. if API changes)
 df_filtered = df_filtered.drop(
     columns=['additionalOptionsFields', 'jumpingSummaryFields', 'groupUnderTestId'],
     errors='ignore'
@@ -242,21 +183,29 @@ df_filtered = df_filtered.drop(
 
 print(f"[smartspeed] Records after profile filter and column drops: {len(df_filtered)}")
 
-# --------------------------------------------------------------------------------------------------
+# The API returns testDateUtc as naive strings (no timezone, e.g. '2026-05-19T16:51:37').
+# Localize to UTC here so the column is datetime64[us, UTC] before concat.
+# This avoids the pandas 3.0.1 bug where pd.to_datetime(mixed_naive+aware, utc=True)
+# converts NAIVE strings to NaT instead of the aware ones.
+df_filtered = df_filtered.copy()
+df_filtered["testDateUtc"] = pd.to_datetime(
+    df_filtered["testDateUtc"], errors="coerce"
+).dt.tz_localize("UTC")
+print(f"[smartspeed] API testDateUtc parsed: {df_filtered['testDateUtc'].notna().sum()} / {len(df_filtered)} non-null")
 
-# append new tests
 file_path = os.path.join(output_dir, "smartspeed.csv")
 
 if os.path.exists(file_path):
     existing_df = pd.read_csv(file_path)
     print(f"[smartspeed] Existing CSV has {len(existing_df)} rows")
+    # Existing CSV has UTC-aware strings (e.g. '2026-02-06 15:58:17+00:00'); utc=True handles them correctly.
+    existing_df["testDateUtc"] = pd.to_datetime(existing_df["testDateUtc"], utc=True, errors="coerce")
 
     combined_df = (
         pd.concat([existing_df, df_filtered], ignore_index=True)
         .drop_duplicates(subset=["profileId", "testResultId", "testDateUtc"], keep="last")
     )
 else:
-    print("[smartspeed] No existing CSV found — creating from scratch")
     combined_df = df_filtered
 
 print(f"[smartspeed] Combined rows after dedup on testResultId+testDateUtc: {len(combined_df)}")
@@ -264,34 +213,22 @@ print(f"[smartspeed] Combined rows after dedup on testResultId+testDateUtc: {len
 # clean data for wrong test type
 if "velocityFields.distance" in combined_df.columns:
     combined_df["velocityFields.distance"] = pd.to_numeric(
-        combined_df["velocityFields.distance"],
-        errors="coerce"
+        combined_df["velocityFields.distance"], errors="coerce"
     )
-
     combined_df.loc[
         (combined_df["testName"].str.strip().str.lower() == "10m sprint") &
         (combined_df["velocityFields.distance"] == 10),
         "testName"
     ] = "Flying 10s"
 
-# take the best test result for a given player on a given date
-# ensure datetime format
-combined_df["testDateUtc"] = pd.to_datetime(combined_df["testDateUtc"], errors="coerce")
-
-# create date-only column (removes time)
 combined_df["testDate"] = combined_df["testDateUtc"].dt.date
+combined_df["bestSplitSeconds"] = pd.to_numeric(combined_df["bestSplitSeconds"], errors="coerce")
 
-# make sure bestSplitSeconds is numeric
-combined_df["bestSplitSeconds"] = pd.to_numeric(
-    combined_df["bestSplitSeconds"],
-    errors="coerce"
-)
-
-# remove reps before 2/6/26
-cutoff_date = pd.Timestamp("2026-02-06")
-combined_df = combined_df[
-    combined_df["testDateUtc"] >= cutoff_date
-]
+cutoff_date = pd.Timestamp("2026-02-06", tz="UTC")
+before_cutoff = len(combined_df)
+combined_df = combined_df[combined_df["testDateUtc"] >= cutoff_date]
+after_cutoff = len(combined_df)
+print(f"[smartspeed] Rows after cutoff filter (>= {cutoff_date.date()}): {after_cutoff} (dropped {before_cutoff - after_cutoff})")
 
 # remove Flying 10s reps where bestSplitSeconds > 2
 combined_df = combined_df[
@@ -301,16 +238,12 @@ combined_df = combined_df[
     )
 ]
 
-# sort so lowest bestSplitSeconds comes first
 combined_df = combined_df.sort_values(
     by=["profileId", "testDate", "bestSplitSeconds"],
     ascending=[True, True, True]
 )
-
-# drop duplicates keeping lowest per name per date
 combined_df = combined_df.drop_duplicates(
-    subset=["profileId", "testDate"],
-    keep="first"
+    subset=["profileId", "testDate"], keep="first"
 )
 
 print(f"[smartspeed] Final rows after best-per-day dedup: {len(combined_df)}")
